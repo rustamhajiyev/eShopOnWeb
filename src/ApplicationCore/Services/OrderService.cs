@@ -1,11 +1,17 @@
-﻿using System.Linq;
+﻿using System;
+using System.Linq;
+using System.Net.Http;
+using System.Net.Http.Json;
+using System.Text.Json;
 using System.Threading.Tasks;
 using Ardalis.GuardClauses;
+using Azure.Messaging.ServiceBus;
 using Microsoft.eShopWeb.ApplicationCore.Entities;
 using Microsoft.eShopWeb.ApplicationCore.Entities.BasketAggregate;
 using Microsoft.eShopWeb.ApplicationCore.Entities.OrderAggregate;
 using Microsoft.eShopWeb.ApplicationCore.Interfaces;
 using Microsoft.eShopWeb.ApplicationCore.Specifications;
+using Microsoft.Extensions.Options;
 
 namespace Microsoft.eShopWeb.ApplicationCore.Services;
 
@@ -15,16 +21,22 @@ public class OrderService : IOrderService
     private readonly IUriComposer _uriComposer;
     private readonly IRepository<Basket> _basketRepository;
     private readonly IRepository<CatalogItem> _itemRepository;
+    private readonly ServiceBusOptions _serviceBusOptions;
+    private readonly AzureFunctionOptions _azureFunctionOptions;
 
     public OrderService(IRepository<Basket> basketRepository,
         IRepository<CatalogItem> itemRepository,
         IRepository<Order> orderRepository,
-        IUriComposer uriComposer)
+        IUriComposer uriComposer,
+        IOptions<ServiceBusOptions> serviceBusOptions,
+        IOptions<AzureFunctionOptions> azureFunctionOptions)
     {
         _orderRepository = orderRepository;
         _uriComposer = uriComposer;
         _basketRepository = basketRepository;
         _itemRepository = itemRepository;
+        _serviceBusOptions = serviceBusOptions.Value;
+        _azureFunctionOptions = azureFunctionOptions.Value;
     }
 
     public async Task CreateOrderAsync(int basketId, Address shippingAddress)
@@ -49,5 +61,36 @@ public class OrderService : IOrderService
         var order = new Order(basket.BuyerId, shippingAddress, items);
 
         await _orderRepository.AddAsync(order);
+
+        await PublishOrder(order);
+        await PublishDelivery(order);
+    }
+
+    private async Task PublishOrder(Order order)
+    {
+        var content = new
+        {
+            OrderId = order.Id,
+            Items = order.OrderItems.Select(i => new { i.Id, i.Units })
+        };
+
+        await using var client = new ServiceBusClient(_serviceBusOptions.ConnectionString);
+        var sender = client.CreateSender("reservations");
+        var message = new ServiceBusMessage(JsonSerializer.Serialize(content));
+        await sender.SendMessageAsync(message);
+    }
+
+    private async Task PublishDelivery(Order order)
+    {
+        var client = new HttpClient();
+
+        var content = JsonContent.Create(new
+        {
+            OrderId = order.Id,
+            Address = order.ShipToAddress,
+            Items = order.OrderItems.Select(i => new { i.Id, i.Units })
+        });
+              
+        await client.PostAsync(new Uri(_azureFunctionOptions.Url), content);
     }
 }
